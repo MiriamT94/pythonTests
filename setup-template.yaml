@@ -1,0 +1,383 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Build template for My projects
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Service
+        Parameters:
+          - ServiceName
+          - AlertEmail
+          - Environment
+          - RelatedAccountId
+          - EpsagonToken
+      - Label:
+          default: GitHub Configuration
+        Parameters:
+          - GitHubOwner
+          - GitHubRepo
+          - GitHubToken
+
+    ParameterLabels:
+      ServiceName:
+        default: Service Name
+      AlertEmail:
+        default: Email
+      Environment:
+        default: Environment
+      RelatedAccountId:
+        default: Related Account Id
+      GitHubOwner:
+        default: Repo Owner
+      GitHubRepo:
+        default: Repo Name
+      GitHubToken:
+        default: Personal Access Token
+      EpsagonToken:
+        default: Epsagon Token
+      ContactEndpointApiKey:
+        default: Api Key used in the contact endpoint
+
+Parameters:
+  ServiceName:
+    Description: Enter a lower case, high level service name without environment details. Used to autofill service names. For example, your-service-name
+    Type: String
+    Default: kerb-delivery
+  AlertEmail:
+    Description: Email address to send staging build alerts to, or example you@example.com
+    Type: String
+  Environment:
+    Description: The service environment (production / staging)
+    Type: String
+    Default: stg
+    AllowedValues:
+      - prod
+      - stg
+      - dev
+  RelatedAccountId:
+    Description: The ID of the Related Account (for "stg" enter the production account id, for "prod" enter the staging account id)
+    Type: String
+  GitHubOwner:
+    Description: Owner of git repo to clone, for example gridsmartercities
+    Type: String
+    Default: gridsmartercities
+  GitHubRepo:
+    Description: Repo to clone, for example kerb-delivery
+    Type: String
+    Default: kerb-delivery
+  GitHubToken:
+    Description: The value of a GitHub Personal Access Token that has an API access to your repo
+    Type: String
+  EpsagonToken:
+    Description: The value of a Epsagon Token for tracing and logging
+    Type: String
+  ContactEndpointApiKey:
+    Description: Api Key used in the contact endpoint
+    Type: String
+
+Conditions:
+  IsProduction: !Equals [ !Ref Environment, prod ]
+  NotProduction: !Not [ !Equals [ !Ref Environment, prod ] ]
+  IsStaging: !Equals [ !Ref Environment, stg ]
+  IsDev: !Equals [ !Ref Environment, dev ]
+
+Resources:
+
+  # Parameters
+  AccountEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/account/EMAIL
+      Type: String
+      Value: !Ref AlertEmail
+  GitHubOwnerParameter:
+    Type: AWS::SSM::Parameter
+    Condition: NotProduction
+    Properties:
+      Name: !Sub /${ServiceName}/build/GITHUB_OWNER
+      Type: String
+      Value: !Sub ${GitHubOwner}
+  GitHubRepoParameter:
+    Type: AWS::SSM::Parameter
+    Condition: NotProduction
+    Properties:
+      Name: !Sub /${ServiceName}/build/GITHUB_REPO
+      Type: String
+      Value: !Sub ${GitHubRepo}
+  GitHubTokenParameter:
+    Type: AWS::SSM::Parameter
+    Condition: NotProduction
+    Properties:
+      Name: !Sub /${ServiceName}/build/GITHUB_TOKEN
+      Type: String
+      Value: !Sub ${GitHubToken}
+  EpsagonTokenParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/build/EPSAGON_TOKEN
+      Type: String
+      Value: !Sub ${EpsagonToken}
+  SamS3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/build/SAM_S3_BUCKET
+      Type: String
+      Value: !Ref CodebuildOutputS3Bucket
+  ProdAccountIdParameter:
+    Type: AWS::SSM::Parameter
+    Condition: NotProduction
+    Properties:
+      Name: !Sub /${ServiceName}/build/PROD_ACCOUNT_ID
+      Type: String
+      Value: !Ref RelatedAccountId
+  SupportEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/support/EMAIL
+      Type: String
+      Value: !Ref SupportEmail
+  ContactEndpointApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}/contact/API_KEY
+      Type: String
+      Value: !Ref ContactEndpointApiKey
+
+  # S3 buckets
+  CodebuildOutputS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ServiceName}-${AWS::Region}-${Environment}-output
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Code Build Alarms
+  CodeBuildFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      AlarmDescription: Triggered when a could build failure occurs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Period: 60
+      Statistic: Sum
+      Threshold: 1.0
+      TreatMissingData: notBreaching
+      AlarmActions:
+      - !Ref CodebuildAlarmTopic
+      Dimensions:
+        - Name: ProjectName
+          Value: !If [IsProduction, !Ref CodebuildProdProject, !If [IsStaging, !Ref CodebuildStgProject, !Ref CodebuildDevProject]]
+
+  CodebuildAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ServiceName}-codebuild-alarms
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+
+  # Permissions
+  CodeBuildSharedPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ServiceName}-${AWS::Region}-${Environment}-codebuild-shared-service-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway
+          - Effect: Allow
+            Action: ssm:GetParameters
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/account/EMAIL
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/CLIENT_ID
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/USERPOOL_ID
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_USERNAME
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_PASSWORD
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_USERNAME_NO_PROFILE
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_PASSWORD_NO_PROFILE
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_DRIVER_USERNAME
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/auth/TEST_DRIVER_PASSWORD
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/SAM_S3_BUCKET
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/GITHUB_OWNER
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/GITHUB_REPO
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/GITHUB_TOKEN
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/EPSAGON_TOKEN
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/PROD_BUILD_REGIONS
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/build/PROJECT_NAME
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/contact/API_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/KERB_DELIVERY_ACCESS_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/KERB_DELIVERY_SECRET_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/NOTIFICATION_USER_ACCESS_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/NOTIFICATION_USER_SECRET_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/TEST_USER_ACCESS_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/TEST_USER_SECRET_KEY
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/KERB_PLATFORM_HOST
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/KERB_PLATFORM_REGION
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/NOTIFICATION_HOST
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}/iam/NOTIFICATION_REGION
+
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:List*
+              - s3:DeleteObject
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PassRole
+              - iam:PutRolePolicy
+              - iam:GetRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:UpdateAssumeRolePolicy
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${ServiceName}-*
+          - Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:DeleteFunction
+              - lambda:AddPermission
+              - lambda:UpdateFunctionCode
+              - lambda:RemovePermission
+              - lambda:ListTags
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:UpdateFunctionConfiguration
+              - lambda:GetLayerVersion
+              - lambda:GetLayerVersionPolicy
+              - lambda:AddLayerVersionPermission
+              - lambda:DeleteLayerVersion
+              - lambda:PublishLayerVersion
+              - lambda:RemoveLayerVersionPermission
+            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ServiceName}-stack-*
+          - Effect: Allow
+            Action:
+              - lambda:GetLayerVersion
+              - lambda:GetLayerVersionPolicy
+              - lambda:AddLayerVersionPermission
+              - lambda:DeleteLayerVersion
+              - lambda:PublishLayerVersion
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - apigateway:PUT
+              - apigateway:POST
+              - apigateway:PATCH
+              - apigateway:DELETE
+              - apigateway:GET
+            Resource: !Sub arn:aws:apigateway:${AWS::Region}::/restapis*
+          - Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListStacks
+              - cloudformation:CreateChangeSet
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:DeleteStack
+            Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DeleteLogGroup
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - SNS:CreateTopic
+              - SNS:GetTopicAttributes
+              - SNS:Subscribe
+              - SNS:DeleteTopic
+              - SNS:SetTopicAttributes
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:DeleteAlarms
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminAddUserToGroup
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:AdminUserGlobalSignOut
+            Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+      Roles:
+        - !Ref CodebuildRole
+  CodebuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-${AWS::Region}-${Environment}-codebuild-service-role
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - codebuild.amazonaws.com
+                AWS:
+                  Fn::If:
+                    - IsProduction
+                    - !Sub arn:aws:iam::${RelatedAccountId}:role/${ServiceName}-${AWS::Region}-stg-codebuild-service-role
+                    - !Ref AWS::NoValue
+              Action:
+                - sts:AssumeRole
+  AmazonAPIGatewayPushToCloudWatchLogs:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-${AWS::Region}-${Environment}-logs-apigateway-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # Api Gateway Account
+  Account:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt AmazonAPIGatewayPushToCloudWatchLogs.Arn
+
+  # Log Groups
+  CodebuildDevLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsDev
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${CodebuildDevProject}
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/welcome
